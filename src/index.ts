@@ -794,6 +794,83 @@ app.get("/api/inbox/stream", (req, res) => {
   });
 });
 
+/** ---------- Meta WhatsApp Webhook ---------- */
+
+/**
+ * GET /webhook
+ * Meta webhook verification handshake.
+ * Meta sends hub.mode, hub.verify_token, hub.challenge as query params.
+ * Respond with hub.challenge as plain text when the token matches.
+ */
+app.get("/webhook", (req, res) => {
+  const mode      = String(req.query["hub.mode"]         ?? "");
+  const token     = String(req.query["hub.verify_token"] ?? "");
+  const challenge = String(req.query["hub.challenge"]    ?? "");
+
+  if (mode === "subscribe" && token === (process.env.META_VERIFY_TOKEN ?? "")) {
+    // eslint-disable-next-line no-console
+    console.log("[mc] Meta webhook verified");
+    return res.status(200).type("text/plain").send(challenge);
+  }
+
+  // eslint-disable-next-line no-console
+  console.warn("[mc] Meta webhook verification failed — bad token or mode");
+  return res.status(403).json({ ok: false, error: "Forbidden" });
+});
+
+/**
+ * POST /webhook
+ * Receives inbound WhatsApp messages from the Meta Cloud API.
+ * Responds 200 immediately (Meta requires a fast acknowledgement).
+ * Extracts sender wa_id, profile name, and message text, then publishes
+ * a message.incoming.whatsapp event into the internal event bus.
+ *
+ * Expected payload shape (Cloud API):
+ * {
+ *   entry: [{
+ *     changes: [{
+ *       value: {
+ *         contacts: [{ wa_id, profile: { name } }],
+ *         messages: [{ from, text: { body }, type }]
+ *       }
+ *     }]
+ *   }]
+ * }
+ */
+app.post("/webhook", (req, res) => {
+  // Acknowledge immediately — Meta will retry if we don't respond quickly.
+  res.sendStatus(200);
+
+  const body = req.body as any;
+  // eslint-disable-next-line no-console
+  console.log("[mc] POST /webhook", JSON.stringify(body));
+
+  try {
+    const value    = body?.entry?.[0]?.changes?.[0]?.value;
+    const message  = value?.messages?.[0];
+    const contact  = value?.contacts?.[0];
+
+    // Only handle inbound text messages; skip status updates and other types.
+    if (!message || message.type !== "text") return;
+
+    const waId = String(contact?.wa_id ?? message.from ?? "unknown");
+    const name = String(contact?.profile?.name ?? "");
+    const text = String(message.text?.body ?? "");
+
+    publish({
+      id: uid(),
+      ts: now(),
+      type: "message.incoming.whatsapp",
+      source: "meta",
+      conversationId: waId,
+      payload: { from: waId, name, text },
+    });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error("[mc] POST /webhook parse error", err);
+  }
+});
+
 /** ---------- Start ---------- */
 const HOST = "0.0.0.0";
 const PORT = Number(process.env.PORT) || Number(process.env.MC_SERVER_PORT) || 8787;
