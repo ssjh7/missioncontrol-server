@@ -801,13 +801,29 @@ app.get("/api/inbox/stream", (req, res) => {
  * Meta webhook verification handshake.
  * Meta sends hub.mode, hub.verify_token, hub.challenge as query params.
  * Respond with hub.challenge as plain text when the token matches.
+ *
+ * Token precedence: META_VERIFY_TOKEN → WHATSAPP_VERIFY_TOKEN → VERIFY_TOKEN
+ * Returns 500 if none of the env vars are set.
+ * Token values are never logged.
  */
 app.get("/webhook", (req, res) => {
+  const expectedToken =
+    process.env.META_VERIFY_TOKEN ||
+    process.env.WHATSAPP_VERIFY_TOKEN ||
+    process.env.VERIFY_TOKEN ||
+    "";
+
+  if (!expectedToken) {
+    // eslint-disable-next-line no-console
+    console.error("[mc] GET /webhook: no verify token env var set (META_VERIFY_TOKEN / WHATSAPP_VERIFY_TOKEN / VERIFY_TOKEN)");
+    return res.status(500).json({ ok: false, error: "Verify token env var not set" });
+  }
+
   const mode      = String(req.query["hub.mode"]         ?? "");
   const token     = String(req.query["hub.verify_token"] ?? "");
   const challenge = String(req.query["hub.challenge"]    ?? "");
 
-  if (mode === "subscribe" && token === (process.env.META_VERIFY_TOKEN ?? "")) {
+  if (mode === "subscribe" && token === expectedToken) {
     // eslint-disable-next-line no-console
     console.log("[mc] Meta webhook verified");
     return res.status(200).type("text/plain").send(challenge);
