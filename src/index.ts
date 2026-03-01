@@ -11,6 +11,7 @@ import { z } from "zod";
  * - Ingress endpoint for real gateway events
  * - Outbox queue for gateway to deliver outgoing messages
  * - Worker Executor health (local tool runner)
+ * - Inbox endpoints: GET /inbox/whatsapp, GET /inbox, GET /api/inbox, GET /api/inbox/stream
  */
 
 type AgentStatus = "running" | "degraded" | "stopped";
@@ -54,13 +55,32 @@ type OutboxItem = {
   ackTs?: number;
 };
 
+/**
+ * Shape returned by all /inbox* endpoints.
+ * Fields are chosen to be compatible with the UI's WhatsAppInbox InboxItem type:
+ *   id, source, from, name, text, timestamp (+ ts and conversationId as extras)
+ */
+type InboxItem = {
+  id: string;
+  ts: number;
+  /** Alias of ts — the UI component reads .timestamp */
+  timestamp: number;
+  conversationId: string;
+  /** Populated from conversationId so UI `name ?? from ?? "unknown"` shows something. */
+  from: string | null;
+  name: string | null;
+  text: string;
+  source: string;
+};
+
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 /**
  * CORS:
- * - allow your local dev UI(s)
- * - allow env override for future LAN mode
+ * - allow local dev UI(s)
+ * - allow any Railway deployment (https://*.up.railway.app)
+ * - allow env override for custom domains
  */
 const ALLOWED_ORIGINS = new Set(
   (process.env.MC_ALLOWED_ORIGINS ||
@@ -70,12 +90,17 @@ const ALLOWED_ORIGINS = new Set(
     .filter(Boolean)
 );
 
+function isRailwayOrigin(origin: string) {
+  return /^https:\/\/[a-z0-9-]+\.up\.railway\.app$/.test(origin);
+}
+
 app.use(
   cors({
     origin: (origin, cb) => {
-      // allow non-browser clients (curl, node fetch)
+      // allow non-browser clients (curl, PowerShell, node fetch)
       if (!origin) return cb(null, true);
       if (ALLOWED_ORIGINS.has(origin)) return cb(null, true);
+      if (isRailwayOrigin(origin)) return cb(null, true);
       return cb(null, false);
     },
     credentials: false,
@@ -87,7 +112,7 @@ const now = () => Date.now();
 const uid = () =>
   Math.random().toString(16).slice(2) + "-" + Math.random().toString(16).slice(2);
 
-/** ---------- SSE Stream ---------- */
+/** ---------- SSE Stream (main telemetry) ---------- */
 type SseClient = { id: string; res: express.Response };
 const sseClients = new Map<string, SseClient>();
 
@@ -96,9 +121,64 @@ function sseSend(evt: string, data: unknown) {
   for (const c of sseClients.values()) c.res.write(payload);
 }
 
+/** ---------- Inbox SSE Stream ---------- */
+const inboxSseClients = new Map<string, SseClient>();
+
+function inboxSseSendEvent(evt: string, data: unknown) {
+  const frame = `event: ${evt}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const c of inboxSseClients.values()) c.res.write(frame);
+}
+
+/** Sends a default (no-event-name) SSE frame — triggers EventSource.onmessage in the UI. */
+function inboxSsePushItem(item: InboxItem) {
+  const frame = `data: ${JSON.stringify(item)}\n\n`;
+  for (const c of inboxSseClients.values()) c.res.write(frame);
+}
+
 /** ---------- Event Log ---------- */
 const EVENT_LOG_MAX = 800;
 const eventLog: EventEnvelope[] = [];
+
+/** ---------- Inbox helpers ---------- */
+const INBOX_MAX = 200;
+
+const INBOUND_TYPES = new Set([
+  "message.incoming.whatsapp",
+  "message.incoming.gmail",
+]);
+
+function eventToInboxItem(e: EventEnvelope): InboxItem {
+  return {
+    id: e.id,
+    ts: e.ts,
+    timestamp: e.ts,
+    conversationId: e.conversationId ?? "unknown",
+    from: e.conversationId ?? null,
+    name: null,
+    text: String((e.payload as any)?.text ?? ""),
+    source: e.source,
+  };
+}
+
+/** Last <=200 inbound WhatsApp messages from eventLog, newest first. */
+function getWhatsappInboxItems(): InboxItem[] {
+  const out: InboxItem[] = [];
+  for (let i = eventLog.length - 1; i >= 0 && out.length < INBOX_MAX; i--) {
+    const e = eventLog[i];
+    if (e.type === "message.incoming.whatsapp") out.push(eventToInboxItem(e));
+  }
+  return out;
+}
+
+/** Last <=200 inbound messages across all channels (whatsapp + gmail), newest first. */
+function getInboxItems(): InboxItem[] {
+  const out: InboxItem[] = [];
+  for (let i = eventLog.length - 1; i >= 0 && out.length < INBOX_MAX; i--) {
+    const e = eventLog[i];
+    if (INBOUND_TYPES.has(e.type)) out.push(eventToInboxItem(e));
+  }
+  return out;
+}
 
 /** ---------- Event Bus ---------- */
 type Subscriber = (e: EventEnvelope) => Promise<void> | void;
@@ -108,6 +188,11 @@ function publish(e: EventEnvelope) {
   eventLog.push(e);
   if (eventLog.length > EVENT_LOG_MAX) eventLog.shift();
   sseSend("event", e);
+
+  // Push inbound messages to inbox SSE clients in real-time
+  if (INBOUND_TYPES.has(e.type)) {
+    inboxSsePushItem(eventToInboxItem(e));
+  }
 
   const subs = subscribers.get(e.type) ?? [];
   for (const fn of subs) {
@@ -397,8 +482,9 @@ subscribers.set("agent.forward.comms", [
     const conversationId = e.conversationId ?? original?.conversationId ?? "unknown";
     const text = String((original?.payload as any)?.text ?? "");
 
-    const preview = text.length > 180 ? text.slice(0, 180) + "…" : text;
-    const reply = `✅ Comms Agent: Received "${preview}"`;
+    // Unicode escapes prevent emoji byte-corruption in terminals / HTTP layers
+    const preview = text.length > 180 ? text.slice(0, 180) + "\u2026" : text;
+    const reply = "\u2705 Comms Agent: Received \"" + preview + "\"";
 
     publish({
       id: uid(),
@@ -422,9 +508,10 @@ subscribers.set("agent.forward.task", [
     const conversationId = e.conversationId ?? original?.conversationId ?? "unknown";
     const text = String((original?.payload as any)?.text ?? "");
 
-    const reply = `📅 Task Agent: I can help with scheduling. You said: "${
-      text.length > 180 ? text.slice(0, 180) + "…" : text
-    }"`;
+    const reply =
+      "\uD83D\uDCC5 Task Agent: I can help with scheduling. You said: \"" +
+      (text.length > 180 ? text.slice(0, 180) + "\u2026" : text) +
+      "\"";
 
     publish({
       id: uid(),
@@ -448,9 +535,10 @@ subscribers.set("agent.forward.memory", [
     const conversationId = e.conversationId ?? original?.conversationId ?? "unknown";
     const text = String((original?.payload as any)?.text ?? "");
 
-    const reply = `🧠 Memory Agent: I heard: "${
-      text.length > 180 ? text.slice(0, 180) + "…" : text
-    }" (memory wiring coming next)`;
+    const reply =
+      "\uD83E\uDDE0 Memory Agent: I heard: \"" +
+      (text.length > 180 ? text.slice(0, 180) + "\u2026" : text) +
+      "\" (memory wiring coming next)";
 
     publish({
       id: uid(),
@@ -474,9 +562,10 @@ subscribers.set("agent.forward.builder", [
     const conversationId = e.conversationId ?? original?.conversationId ?? "unknown";
     const text = String((original?.payload as any)?.text ?? "");
 
-    const reply = `🛠️ Builder Agent: I can help with UI/config/build tasks. You said: "${
-      text.length > 180 ? text.slice(0, 180) + "…" : text
-    }"`;
+    const reply =
+      "\uD83D\uDEE0\uFE0F Builder Agent: I can help with UI/config/build tasks. You said: \"" +
+      (text.length > 180 ? text.slice(0, 180) + "\u2026" : text) +
+      "\"";
 
     publish({
       id: uid(),
@@ -565,7 +654,6 @@ app.post("/agents/:id/toggle", (req, res) => {
 });
 
 app.get("/events", (req, res) => {
-  // SSE endpoint
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -662,6 +750,63 @@ app.post("/outbox/ack", (req, res) => {
   return res.json({ ok: true, item });
 });
 
+/** ---------- Inbox Routes ---------- */
+
+/**
+ * GET /inbox/whatsapp
+ * Returns the latest <=200 inbound WhatsApp messages derived from eventLog.
+ * Filters: type === "message.incoming.whatsapp"
+ * Shape: { ok: true, items: [{ id, ts, timestamp, conversationId, from, name, text, source }] }
+ */
+app.get("/inbox/whatsapp", (_req, res) => {
+  res.json({ ok: true, items: getWhatsappInboxItems() });
+});
+
+/**
+ * GET /inbox
+ * Returns the latest <=200 inbound messages across all channels (whatsapp + gmail).
+ * Shape: { ok: true, items: [...] }
+ */
+app.get("/inbox", (_req, res) => {
+  res.json({ ok: true, items: getInboxItems() });
+});
+
+/**
+ * GET /api/inbox
+ * Alias of GET /inbox/whatsapp — matches the path called by the UI WhatsAppInbox component
+ * (fetchInbox uses `${baseUrl}/api/inbox`).
+ */
+app.get("/api/inbox", (_req, res) => {
+  res.json({ ok: true, items: getWhatsappInboxItems() });
+});
+
+/**
+ * GET /api/inbox/stream
+ * SSE stream consumed by the UI's WhatsAppInbox component.
+ *
+ * Protocol:
+ *   event: hello     — fires immediately; triggers status="open" in the UI
+ *   event: snapshot  — fires immediately; full array of current WhatsApp inbox items
+ *   data: <item>     — (no event name) fires for each new inbound WhatsApp message;
+ *                      triggers EventSource.onmessage in the UI
+ */
+app.get("/api/inbox/stream", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  const id = uid();
+  inboxSseClients.set(id, { id, res });
+
+  res.write(`event: hello\ndata: ${JSON.stringify({ ok: true })}\n\n`);
+  res.write(`event: snapshot\ndata: ${JSON.stringify(getWhatsappInboxItems())}\n\n`);
+
+  req.on("close", () => {
+    inboxSseClients.delete(id);
+  });
+});
+
 /** ---------- Start ---------- */
 const HOST = "0.0.0.0";
 const PORT = Number(process.env.PORT) || Number(process.env.MC_SERVER_PORT) || 8787;
@@ -670,7 +815,7 @@ app.listen(PORT, HOST, () => {
   // eslint-disable-next-line no-console
   console.log(`[mc] Server listening on http://${HOST}:${PORT}`);
   // eslint-disable-next-line no-console
-  console.log(`[mc] Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(", ")}`);
+  console.log(`[mc] Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(", ")} + *.up.railway.app`);
   // eslint-disable-next-line no-console
   console.log(`[mc] Worker executor: ${WORKER_EXECUTOR_ENABLED ? WORKER_EXECUTOR_URL : "DISABLED"}`);
 });
