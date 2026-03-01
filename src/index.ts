@@ -58,19 +58,22 @@ type OutboxItem = {
 /**
  * Shape returned by all /inbox* endpoints.
  * Fields are chosen to be compatible with the UI's WhatsAppInbox InboxItem type:
- *   id, source, from, name, text, timestamp (+ ts and conversationId as extras)
+ *   id, source, from, name, text, timestamp (ISO string) + ts, conversationId, raw
  */
 type InboxItem = {
   id: string;
   ts: number;
-  /** Alias of ts — the UI component reads .timestamp */
-  timestamp: number;
+  /** ISO-8601 string — the UI component reads .timestamp */
+  timestamp: string;
+  source: string;
   conversationId: string;
-  /** Populated from conversationId so UI `name ?? from ?? "unknown"` shows something. */
+  /** Sender phone/ID from payload, falls back to conversationId. */
   from: string | null;
+  /** Sender display name from payload. */
   name: string | null;
   text: string;
-  source: string;
+  /** Original event envelope — retained for debugging / downstream processing. */
+  raw: unknown;
 };
 
 const app = express();
@@ -124,14 +127,13 @@ function sseSend(evt: string, data: unknown) {
 /** ---------- Inbox SSE Stream ---------- */
 const inboxSseClients = new Map<string, SseClient>();
 
-function inboxSseSendEvent(evt: string, data: unknown) {
+/**
+ * Sends a named SSE frame to all inbox stream clients.
+ * The UI listens for EventSource.addEventListener("inbox", ...) for new items
+ * and EventSource.addEventListener("snapshot", ...) for the initial load.
+ */
+function inboxSseSend(evt: string, data: unknown) {
   const frame = `event: ${evt}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const c of inboxSseClients.values()) c.res.write(frame);
-}
-
-/** Sends a default (no-event-name) SSE frame — triggers EventSource.onmessage in the UI. */
-function inboxSsePushItem(item: InboxItem) {
-  const frame = `data: ${JSON.stringify(item)}\n\n`;
   for (const c of inboxSseClients.values()) c.res.write(frame);
 }
 
@@ -139,45 +141,31 @@ function inboxSsePushItem(item: InboxItem) {
 const EVENT_LOG_MAX = 800;
 const eventLog: EventEnvelope[] = [];
 
-/** ---------- Inbox helpers ---------- */
-const INBOX_MAX = 200;
-
-const INBOUND_TYPES = new Set([
-  "message.incoming.whatsapp",
-  "message.incoming.gmail",
-]);
+/** ---------- Inbox Store ---------- */
+const INBOX_MAX = 500;
+const inbox: InboxItem[] = [];
 
 function eventToInboxItem(e: EventEnvelope): InboxItem {
+  const p = e.payload as any;
   return {
     id: e.id,
     ts: e.ts,
-    timestamp: e.ts,
-    conversationId: e.conversationId ?? "unknown",
-    from: e.conversationId ?? null,
-    name: null,
-    text: String((e.payload as any)?.text ?? ""),
+    timestamp: new Date(e.ts).toISOString(),
     source: e.source,
+    conversationId: e.conversationId ?? "unknown",
+    from: p?.from ?? e.conversationId ?? null,
+    name: p?.name ?? null,
+    text: String(p?.text ?? ""),
+    raw: e,
   };
 }
 
-/** Last <=200 inbound WhatsApp messages from eventLog, newest first. */
-function getWhatsappInboxItems(): InboxItem[] {
-  const out: InboxItem[] = [];
-  for (let i = eventLog.length - 1; i >= 0 && out.length < INBOX_MAX; i--) {
-    const e = eventLog[i];
-    if (e.type === "message.incoming.whatsapp") out.push(eventToInboxItem(e));
-  }
-  return out;
-}
-
-/** Last <=200 inbound messages across all channels (whatsapp + gmail), newest first. */
-function getInboxItems(): InboxItem[] {
-  const out: InboxItem[] = [];
-  for (let i = eventLog.length - 1; i >= 0 && out.length < INBOX_MAX; i--) {
-    const e = eventLog[i];
-    if (INBOUND_TYPES.has(e.type)) out.push(eventToInboxItem(e));
-  }
-  return out;
+function pushToInbox(e: EventEnvelope) {
+  const item = eventToInboxItem(e);
+  inbox.push(item);
+  if (inbox.length > INBOX_MAX) inbox.splice(0, inbox.length - INBOX_MAX);
+  // Notify all SSE inbox stream clients of the new item
+  inboxSseSend("inbox", item);
 }
 
 /** ---------- Event Bus ---------- */
@@ -189,9 +177,9 @@ function publish(e: EventEnvelope) {
   if (eventLog.length > EVENT_LOG_MAX) eventLog.shift();
   sseSend("event", e);
 
-  // Push inbound messages to inbox SSE clients in real-time
-  if (INBOUND_TYPES.has(e.type)) {
-    inboxSsePushItem(eventToInboxItem(e));
+  // Push inbound WhatsApp messages into the dedicated inbox store
+  if (e.type === "message.incoming.whatsapp") {
+    pushToInbox(e);
   }
 
   const subs = subscribers.get(e.type) ?? [];
@@ -754,30 +742,30 @@ app.post("/outbox/ack", (req, res) => {
 
 /**
  * GET /inbox/whatsapp
- * Returns the latest <=200 inbound WhatsApp messages derived from eventLog.
- * Filters: type === "message.incoming.whatsapp"
- * Shape: { ok: true, items: [{ id, ts, timestamp, conversationId, from, name, text, source }] }
+ * Returns all inbound WhatsApp messages from the in-memory inbox store.
+ * Shape: { ok: true, items: InboxItem[] }  — items is ALWAYS an array.
  */
 app.get("/inbox/whatsapp", (_req, res) => {
-  res.json({ ok: true, items: getWhatsappInboxItems() });
+  res.json({ ok: true, items: inbox.slice() });
 });
 
 /**
  * GET /inbox
- * Returns the latest <=200 inbound messages across all channels (whatsapp + gmail).
- * Shape: { ok: true, items: [...] }
+ * Alias of /inbox/whatsapp — returns all inbound WhatsApp messages.
+ * Shape: { ok: true, items: InboxItem[] }  — items is ALWAYS an array.
  */
 app.get("/inbox", (_req, res) => {
-  res.json({ ok: true, items: getInboxItems() });
+  res.json({ ok: true, items: inbox.slice() });
 });
 
 /**
  * GET /api/inbox
- * Alias of GET /inbox/whatsapp — matches the path called by the UI WhatsAppInbox component
- * (fetchInbox uses `${baseUrl}/api/inbox`).
+ * Matches the path called by the UI WhatsAppInbox component (fetchInbox uses `${baseUrl}/api/inbox`).
+ * Returns all inbound WhatsApp messages from the in-memory inbox store.
+ * Shape: { ok: true, items: InboxItem[] }  — items is ALWAYS an array.
  */
 app.get("/api/inbox", (_req, res) => {
-  res.json({ ok: true, items: getWhatsappInboxItems() });
+  res.json({ ok: true, items: inbox.slice() });
 });
 
 /**
@@ -785,13 +773,12 @@ app.get("/api/inbox", (_req, res) => {
  * SSE stream consumed by the UI's WhatsAppInbox component.
  *
  * Protocol:
- *   event: hello     — fires immediately; triggers status="open" in the UI
- *   event: snapshot  — fires immediately; full array of current WhatsApp inbox items
- *   data: <item>     — (no event name) fires for each new inbound WhatsApp message;
- *                      triggers EventSource.onmessage in the UI
+ *   event: hello     — fires immediately; confirms connection is open
+ *   event: snapshot  — fires immediately; full array of current inbox items
+ *   event: inbox     — fires for each new inbound WhatsApp message (single InboxItem)
  */
 app.get("/api/inbox/stream", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
@@ -800,7 +787,7 @@ app.get("/api/inbox/stream", (req, res) => {
   inboxSseClients.set(id, { id, res });
 
   res.write(`event: hello\ndata: ${JSON.stringify({ ok: true })}\n\n`);
-  res.write(`event: snapshot\ndata: ${JSON.stringify(getWhatsappInboxItems())}\n\n`);
+  res.write(`event: snapshot\ndata: ${JSON.stringify(inbox.slice())}\n\n`);
 
   req.on("close", () => {
     inboxSseClients.delete(id);
