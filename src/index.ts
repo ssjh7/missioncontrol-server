@@ -279,7 +279,7 @@ function seedAgents() {
       name: "Worker Executor (Local)",
       version: "0.1.0",
       enabled: true,
-      status: "stopped", // will be updated by health poll
+      status: "stopped", // will be updated by health poll (if enabled)
       subscriptions: ["system.health.alert"],
       allowedTools: ["worker.health", "worker.run"],
       rateLimitPerMin: 120,
@@ -492,7 +492,8 @@ subscribers.set("agent.forward.builder", [
 ]);
 
 /** ---------- Worker Executor health polling ---------- */
-const WORKER_EXECUTOR_URL = process.env.MC_WORKER_EXECUTOR_URL || "http://127.0.0.1:5176";
+const WORKER_EXECUTOR_URL = process.env.MC_WORKER_EXECUTOR_URL || "";
+const WORKER_EXECUTOR_ENABLED = /^https?:\/\//.test(WORKER_EXECUTOR_URL);
 
 async function pollWorkerExecutor() {
   const a = agents.get("worker.executor.local");
@@ -532,9 +533,11 @@ async function pollWorkerExecutor() {
   }
 }
 
-setInterval(() => {
-  void pollWorkerExecutor();
-}, 5_000);
+if (WORKER_EXECUTOR_ENABLED) {
+  setInterval(() => {
+    void pollWorkerExecutor();
+  }, 5_000);
+}
 
 /** ---------- Routes ---------- */
 
@@ -544,7 +547,7 @@ app.get("/health", (_req, res) => {
     name: "openclaw-mission-control-server",
     time: new Date().toISOString(),
     agents: getAgentsArray().length,
-    workerExecutorUrl: WORKER_EXECUTOR_URL,
+    workerExecutorUrl: WORKER_EXECUTOR_ENABLED ? WORKER_EXECUTOR_URL : "DISABLED",
   });
 });
 
@@ -669,5 +672,5 @@ app.listen(PORT, HOST, () => {
   // eslint-disable-next-line no-console
   console.log(`[mc] Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(", ")}`);
   // eslint-disable-next-line no-console
-  console.log(`[mc] Worker executor: ${WORKER_EXECUTOR_URL}`);
+  console.log(`[mc] Worker executor: ${WORKER_EXECUTOR_ENABLED ? WORKER_EXECUTOR_URL : "DISABLED"}`);
 });
